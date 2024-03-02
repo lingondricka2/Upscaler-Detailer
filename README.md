@@ -1,7 +1,9 @@
 Proof of concept node that upscales the segments inside a detailer node, faster, uses less VRAM and for some reason less noticeably seams. To be used together with "Make Tile SEGS" from Impact-pack
 
 Upscaling to 16k:
+
 Upscaler + detailer took 3897 seconds and almost went OOM with an Geforce gtx 4090
+
 This node took 1820 seconds
 
 Most code taken from Impact-pack https://github.com/ltdrdata/ComfyUI-Impact-Pack
