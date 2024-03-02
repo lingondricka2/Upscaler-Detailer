@@ -1,6 +1,4 @@
-Proof of concept node that lets you upscale each segment
-
-Helps with VRAM issues above 4k upscaling, especially with certain controlnet preprocessors.
+Proof of concept node that upscales the segments inside a detailer node, helps with VRAM issues using controlnet preprocessors with large images.
 
 Most code taken from Impact-pack https://github.com/ltdrdata/ComfyUI-Impact-Pack
 
