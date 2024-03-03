@@ -12,10 +12,116 @@ from comfy import model_management
 from comfy.k_diffusion import sampling as k_diffusion_sampling
 from comfy import samplers
 from comfy_extras import nodes_custom_sampler
+from concurrent.futures import ThreadPoolExecutor
 
 SEG = namedtuple("SEG",
                   ['cropped_image', 'cropped_mask', 'confidence', 'crop_region', 'bbox', 'label', 'control_net_wrapper'],
                   defaults=[None])
+
+def make_crop_region(w, h, bbox, crop_factor, crop_min_size=None):
+    x1 = bbox[0]
+    y1 = bbox[1]
+    x2 = bbox[2]
+    y2 = bbox[3]
+
+    bbox_w = x2 - x1
+    bbox_h = y2 - y1
+
+    crop_w = bbox_w * crop_factor
+    crop_h = bbox_h * crop_factor
+
+    if crop_min_size is not None:
+        crop_w = max(crop_min_size, crop_w)
+        crop_h = max(crop_min_size, crop_h)
+
+    kernel_x = x1 + bbox_w / 2
+    kernel_y = y1 + bbox_h / 2
+
+    new_x1 = int(kernel_x - crop_w / 2)
+    new_y1 = int(kernel_y - crop_h / 2)
+
+    # make sure position in (w,h)
+    new_x1, new_x2 = normalize_region(w, new_x1, crop_w)
+    new_y1, new_y2 = normalize_region(h, new_y1, crop_h)
+
+    return [new_x1, new_y1, new_x2, new_y2]
+
+def normalize_region(limit, startp, size):
+    if startp < 0:
+        new_endp = min(limit, size)
+        new_startp = 0
+    elif startp + size > limit:
+        new_startp = max(0, limit - size)
+        new_endp = limit
+    else:
+        new_startp = startp
+        new_endp = min(limit, startp+size)
+
+    return int(new_startp), int(new_endp)
+
+def random_mask_raw(mask, bbox, factor):
+    x1, y1, x2, y2 = bbox
+    w = x2 - x1
+    h = y2 - y1
+
+    factor = int(min(w, h) * factor / 4)
+
+    def draw_random_circle(center, radius):
+        i, j = center
+        for x in range(int(i - radius), int(i + radius)):
+            for y in range(int(j - radius), int(j + radius)):
+                if np.linalg.norm(np.array([x, y]) - np.array([i, j])) <= radius:
+                    mask[x, y] = 1
+
+    def draw_irregular_line(start, end, pivot, is_vertical):
+        i = start
+        while i < end:
+            base_radius = np.random.randint(5, factor)
+            radius = int(base_radius)
+
+            if is_vertical:
+                draw_random_circle((i, pivot), radius)
+            else:
+                draw_random_circle((pivot, i), radius)
+
+            i += radius
+
+    def draw_irregular_line_parallel(start, end, pivot, is_vertical):
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = []
+            step = (end - start) // 16
+            for i in range(start, end, step):
+                future = executor.submit(draw_irregular_line, i, min(i + step, end), pivot, is_vertical)
+                futures.append(future)
+
+            for future in futures:
+                future.result()
+
+    draw_irregular_line_parallel(y1 + factor, y2 - factor, x1 + factor, True)
+    draw_irregular_line_parallel(y1 + factor, y2 - factor, x2 - factor, True)
+    draw_irregular_line_parallel(x1 + factor, x2 - factor, y1 + factor, False)
+    draw_irregular_line_parallel(x1 + factor, x2 - factor, y2 - factor, False)
+
+    mask[y1 + factor:y2 - factor, x1 + factor:x2 - factor] = 1.0
+
+
+def random_mask(mask, bbox, factor, size=128):
+    small_mask = np.zeros((size, size)).astype(np.float32)
+    random_mask_raw(small_mask, (0, 0, size, size), factor)
+
+    x1, y1, x2, y2 = bbox
+    small_mask = torch.tensor(small_mask).unsqueeze(0).unsqueeze(0)
+    bbox_mask = torch.nn.functional.interpolate(small_mask, size=(y2 - y1, x2 - x1), mode='bilinear', align_corners=False)
+    bbox_mask = bbox_mask.squeeze(0).squeeze(0)
+    mask[y1:y2, x1:x2] = bbox_mask
+
+
+def adaptive_mask_paste(dest_mask, src_mask, bbox):
+    x1, y1, x2, y2 = bbox
+    small_mask = torch.tensor(src_mask).unsqueeze(0).unsqueeze(0)
+    bbox_mask = torch.nn.functional.interpolate(small_mask, size=(y2 - y1, x2 - x1), mode='bilinear', align_corners=False)
+    bbox_mask = bbox_mask.squeeze(0).squeeze(0)
+    dest_mask[y1:y2, x1:x2] = bbox_mask
 
 def calculate_sigmas(model, sampler, scheduler, steps):
     discard_penultimate_sigma = False
@@ -227,6 +333,9 @@ def tensor_get_size(image):
 def tensor2pil(image):
     _tensor_check_image(image)
     return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(0), 0, 255).astype(np.uint8))
+
+def tensor2pil_upscaler(image):
+    return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
 
 
 def pil2tensor(image):
@@ -446,9 +555,9 @@ def apply_resize_image(image: Image.Image, original_width, original_height, roun
 def upscaler(image, upscale_model, rescale_factor, resampling_method, supersample, rounding_modulus):
     up_model = load_model(upscale_model)
     up_image = upscale_with_model(up_model, image)  
-    pil_img = tensor2pil(image)
+    pil_img = tensor2pil_upscaler(image)
     original_width, original_height = pil_img.size
-    scaled_image = pil2tensor(apply_resize_image(tensor2pil(up_image), original_width, original_height, rounding_modulus, 'rescale', 
+    scaled_image = pil2tensor(apply_resize_image(tensor2pil_upscaler(up_image), original_width, original_height, rounding_modulus, 'rescale', 
                                                     supersample, rescale_factor, 1024, resampling_method))
     return scaled_image
 
@@ -528,7 +637,7 @@ class UpscalerDetailer:
                     "clip": ("CLIP",),
                     "vae": ("VAE",),
                     "upscale_model": (folder_paths.get_filename_list("upscale_models"), ),
-                    "rescale_factor": ("FLOAT", {"default": 2, "min": 0.01, "max": 100.0, "step": 0.01}),
+                    "rescale_factor": ("DATA",),
                     "resampling_method": (resampling_methods,),                     
                     "supersample": (["true", "false"],),   
                     "rounding_modulus": ("INT", {"default": 8, "min": 8, "max": 1024, "step": 8}),
@@ -614,14 +723,161 @@ class UpscalerDetailer:
         enhanced_img = tensor_convert_rgb(new_image)
 
         return (enhanced_img, )
+    
+class MakeTileSEGSForUpscaler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "image": ("IMAGE", ),
+                     "upscale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 100, "step": 0.1}),
+                     "tile_size": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 8}),
+                     "crop_factor": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 10, "step": 0.1}),
+                     "mask_irregularity": ("FLOAT", {"default": 0, "min": 0, "max": 1.0, "step": 0.01}),
+                     "irregular_mask_mode": (["Reuse fast", "Reuse quality", "All random fast", "All random quality"],)
+                    },
+                }
+
+    RETURN_TYPES = ("SEGS", "DATA", ) 
+
+    FUNCTION = "doit"
+
+    CATEGORY = "ImpactPack/__for_testing"
+
+    def doit(self, image, upscale, tile_size, crop_factor, mask_irregularity=0, irregular_mask_mode="Reuse fast"):
+        _, ih, iw, _ = image.size()
+        bbox_size = int((tile_size / crop_factor) / upscale)
+        mask_cache = None
+        mask_quality = 512
+        if mask_irregularity > 0:
+            if irregular_mask_mode == "Reuse fast":
+                mask_quality = 128
+                mask_cache = np.zeros((128, 128)).astype(np.float32)
+                random_mask(mask_cache, (0, 0, 128, 128), factor=mask_irregularity, size=mask_quality)
+            elif irregular_mask_mode == "Reuse quality":
+                mask_quality = 512
+                mask_cache = np.zeros((512, 512)).astype(np.float32)
+                random_mask(mask_cache, (0, 0, 512, 512), factor=mask_irregularity, size=mask_quality)
+            elif irregular_mask_mode == "All random fast":
+                mask_quality = 512
+
+  
+        exclusion_mask = None
+        start_x = 0
+        start_y = 0
+        h, w = ih, iw
+        and_mask = None
+
+        # calculate tile factors
+        if bbox_size > h or bbox_size > w:
+            new_bbox_size = min(bbox_size, min(w, h))
+            print(f"[MaskTileSEGS] bbox_size is greater than resolution (value changed: {bbox_size} => {new_bbox_size}")
+            bbox_size = new_bbox_size
+
+        n_horizontal = int(w / bbox_size)
+        n_vertical = int(h / bbox_size)
+        
+        while (((bbox_size - (bbox_size * mask_irregularity * 0.2)) * n_horizontal) - w) < 1:
+            n_horizontal += 1
+            
+        while (((bbox_size - (bbox_size * mask_irregularity * 0.2)) * n_vertical) - w) < 1:
+            n_vertical += 1
+
+        w_overlap_sum = (bbox_size * n_horizontal) - w
+
+        w_overlap_size = 0 if n_horizontal == 1 else int(w_overlap_sum/(n_horizontal-1))
+
+        h_overlap_sum = (bbox_size * n_vertical) - h
+
+        h_overlap_size = 0 if n_vertical == 1 else int(h_overlap_sum/(n_vertical-1))
+
+        new_segs = []
+
+        y = start_y
+        for j in range(0, n_vertical):
+            x = start_x
+            for i in range(0, n_horizontal):
+                x1 = x
+                y1 = y
+
+                if x+bbox_size < iw-1:
+                    x2 = x+bbox_size
+                else:
+                    x2 = iw
+                    x1 = iw-bbox_size
+
+                if y+bbox_size < ih-1:
+                    y2 = y+bbox_size
+                else:
+                    y2 = ih
+                    y1 = ih-bbox_size
+
+                bbox = x1, y1, x2, y2
+                crop_region = make_crop_region(iw, ih, bbox, crop_factor)
+                cx1, cy1, cx2, cy2 = crop_region
+
+                mask = np.zeros((cy2 - cy1, cx2 - cx1)).astype(np.float32)
+
+                rel_left = x1 - cx1
+                rel_top = y1 - cy1
+                rel_right = x2 - cx1
+                rel_bot = y2 - cy1
+
+                if mask_irregularity > 0:
+                    if mask_cache is not None:
+                        adaptive_mask_paste(mask, mask_cache, (rel_left, rel_top, rel_right, rel_bot))
+                    else:
+                        random_mask(mask, (rel_left, rel_top, rel_right, rel_bot), factor=mask_irregularity, size=mask_quality)
+
+                    # corner filling
+                    if rel_left == 0:
+                        pad = int((x2 - x1) / 8)
+                        mask[rel_top:rel_bot, :pad] = 1.0
+
+                    if rel_top == 0:
+                        pad = int((y2 - y1) / 8)
+                        mask[:pad, rel_left:rel_right] = 1.0
+
+                    if rel_right == mask.shape[1]:
+                        pad = int((x2 - x1) / 8)
+                        mask[rel_top:rel_bot, -pad:] = 1.0
+
+                    if rel_bot == mask.shape[0]:
+                        pad = int((y2 - y1) / 8)
+                        mask[-pad:, rel_left:rel_right] = 1.0
+                else:
+                    mask[rel_top:rel_bot, rel_left:rel_right] = 1.0
+
+                mask = torch.tensor(mask)
+
+                if exclusion_mask is not None:
+                    exclusion_mask_cropped = exclusion_mask[cy1:cy2, cx1:cx2]
+                    mask[exclusion_mask_cropped != 0] = 0.0
+
+                if and_mask is not None:
+                    and_mask_cropped = and_mask[cy1:cy2, cx1:cx2]
+                    mask[and_mask_cropped == 0] = 0.0
+
+                is_mask_zero = torch.all(mask == 0.0).item()
+
+                if not is_mask_zero:
+                    item = SEG(None, mask.numpy(), 1.0, crop_region, bbox, "", None)
+                    new_segs.append(item)
+
+                x += bbox_size - w_overlap_size
+            y += bbox_size - h_overlap_size
+
+        res = (ih, iw), new_segs  # segs
+        return (res, upscale, )
 
     
 NODE_CLASS_MAPPINGS = {
-    "UpscalerDetailer": UpscalerDetailer
+    "UpscalerDetailer": UpscalerDetailer,
+    "MakeTileSEGSForUpscaler": MakeTileSEGSForUpscaler
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UpscalerDetailer": "UpscalerDetailer"
+    "UpscalerDetailer": "UpscalerDetailer",
+    "MakeTileSEGSForUpscaler": "MakeTileSEGSForUpscaler"
 }
 
 
