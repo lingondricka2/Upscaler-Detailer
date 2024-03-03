@@ -1,6 +1,6 @@
 Proof of concept node that upscales the segments inside a detailer node, faster, uses less VRAM and for some reason less noticeably seams. 
 
-Also a modified "Make Tile SEGS" that automatically calculate bbox based on crop region, scale factor and upscale
+Also a modified "Make Tile SEGS" that automatically calculate bbox based on crop region, crop factor and upscale.
 
 Upscaling to 16k:
 
